@@ -125,7 +125,10 @@ def acp_share_dir(tmp_path: Path) -> Path:
             "scripted_provider": {
                 "type": "_scripted_echo",
                 "base_url": "",
-                "api_key": "",
+                # Dummy key: the ACP session-entry gate skips login for
+                # static-credential providers only when the effective key is
+                # non-empty. The echo provider itself ignores the key.
+                "api_key": "dummy-key-for-acp-auth-gate",
                 "env": {
                     "KIMI_SCRIPTED_ECHO_SCRIPTS": str(scripts_path),
                     "KIMI_SCRIPTED_ECHO_TRACE": trace_env,
