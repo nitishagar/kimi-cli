@@ -6,6 +6,7 @@ import json
 import os
 import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -98,8 +99,7 @@ class ACPTestClient:
         pass
 
 
-@pytest.fixture
-def acp_share_dir(tmp_path: Path) -> Path:
+def _make_acp_share_dir(tmp_path: Path, *, api_key: str, with_token: bool) -> Path:
     """Create a share dir with _scripted_echo config at config.toml."""
     share_dir = tmp_path / "share"
     share_dir.mkdir()
@@ -125,7 +125,7 @@ def acp_share_dir(tmp_path: Path) -> Path:
             "scripted_provider": {
                 "type": "_scripted_echo",
                 "base_url": "",
-                "api_key": "",
+                "api_key": api_key,
                 "env": {
                     "KIMI_SCRIPTED_ECHO_SCRIPTS": str(scripts_path),
                     "KIMI_SCRIPTED_ECHO_TRACE": trace_env,
@@ -138,6 +138,9 @@ def acp_share_dir(tmp_path: Path) -> Path:
 
     config_path = share_dir / "config.toml"
     config_path.write_text(tomlkit.dumps(config_data), encoding="utf-8")
+
+    if not with_token:
+        return share_dir
 
     # Provide pre-authenticated credentials for integration tests.
     # _check_auth() only verifies token file exists with non-empty access_token —
@@ -163,15 +166,27 @@ def acp_share_dir(tmp_path: Path) -> Path:
     return share_dir
 
 
-@pytest_asyncio.fixture
-async def acp_client(
-    acp_share_dir: Path, tmp_path: Path
+@pytest.fixture
+def acp_share_dir(tmp_path: Path) -> Path:
+    """Share dir with a _scripted_echo config plus pre-seeded token credentials."""
+    return _make_acp_share_dir(tmp_path, api_key="", with_token=True)
+
+
+@pytest.fixture
+def acp_share_dir_no_token(tmp_path: Path) -> Path:
+    """Share dir with a static-key custom provider and no token credentials."""
+    return _make_acp_share_dir(tmp_path, api_key="static-test-key", with_token=False)
+
+
+@asynccontextmanager
+async def _spawn_acp_client(
+    share_dir: Path,
 ) -> AsyncIterator[tuple[acp.ClientSideConnection, ACPTestClient]]:
     """Spawn a kimi ACP subprocess and return the SDK connection + test client."""
     test_client = ACPTestClient()
     env = {
         **os.environ,
-        "KIMI_SHARE_DIR": str(acp_share_dir),
+        "KIMI_SHARE_DIR": str(share_dir),
     }
 
     async with acp.spawn_agent_process(
@@ -183,3 +198,21 @@ async def acp_client(
         use_unstable_protocol=True,
     ) as (conn, process):
         yield conn, test_client
+
+
+@pytest_asyncio.fixture
+async def acp_client(
+    acp_share_dir: Path, tmp_path: Path
+) -> AsyncIterator[tuple[acp.ClientSideConnection, ACPTestClient]]:
+    """Spawn a kimi ACP subprocess and return the SDK connection + test client."""
+    async with _spawn_acp_client(acp_share_dir) as client:
+        yield client
+
+
+@pytest_asyncio.fixture
+async def acp_client_no_token(
+    acp_share_dir_no_token: Path, tmp_path: Path
+) -> AsyncIterator[tuple[acp.ClientSideConnection, ACPTestClient]]:
+    """Spawn a kimi ACP subprocess whose share dir has no token credentials."""
+    async with _spawn_acp_client(acp_share_dir_no_token) as client:
+        yield client

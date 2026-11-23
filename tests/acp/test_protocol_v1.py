@@ -210,3 +210,19 @@ async def test_cancel_session(
 
     # cancel should not raise
     await conn.cancel(session_id=session_resp.session_id)
+
+
+async def test_new_session_without_token_for_static_key_provider(
+    acp_client_no_token: tuple[acp.ClientSideConnection, ACPTestClient],
+    tmp_path,
+):
+    """session/new succeeds with no Kimi token for a static-key provider (#2633)."""
+    conn, _ = acp_client_no_token
+    await conn.initialize(protocol_version=1)
+
+    work_dir = tmp_path / "workdir"
+    work_dir.mkdir(exist_ok=True)
+    resp = await conn.new_session(cwd=str(work_dir))
+
+    assert isinstance(resp.session_id, str)
+    assert len(resp.session_id) > 0
