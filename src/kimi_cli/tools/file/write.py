@@ -11,6 +11,7 @@ from kimi_cli.soul.approval import Approval
 from kimi_cli.tools.display import DisplayBlock
 from kimi_cli.tools.file import FileActions
 from kimi_cli.tools.file.plan_mode import inspect_plan_edit_target
+from kimi_cli.tools.file.utils import verify_file_bytes
 from kimi_cli.tools.utils import load_desc
 from kimi_cli.utils.diff import build_diff_blocks
 from kimi_cli.utils.logging import logger
@@ -121,13 +122,12 @@ class WriteFile(CallableTool2[Params]):
                 )
 
             file_existed = await p.exists()
-            old_text = None
+            old_bytes = b""
             if file_existed:
-                old_text = await p.read_text(errors="replace")
+                old_bytes = await p.read_bytes()
+            old_text = old_bytes.decode("utf-8", errors="replace")
 
-            new_text = (
-                params.content if params.mode == "overwrite" else (old_text or "") + params.content
-            )
+            new_text = params.content if params.mode == "overwrite" else old_text + params.content
             diff_blocks: list[DisplayBlock] = await build_diff_blocks(
                 str(p),
                 old_text or "",
@@ -158,6 +158,26 @@ class WriteFile(CallableTool2[Params]):
                     await p.write_text(params.content)
                 case "append":
                     await p.append_text(params.content)
+
+            # Verify the write landed on disk; never report success for a
+            # write that silently failed (GH-2617).
+            new_bytes = params.content.encode("utf-8")
+            expected_bytes = new_bytes if params.mode == "overwrite" else old_bytes + new_bytes
+            if not await verify_file_bytes(p, expected_bytes):
+                logger.warning(
+                    "WriteFile verification failed: {path}: disk content differs "
+                    "after write (mode={mode})",
+                    path=params.path,
+                    mode=params.mode,
+                )
+                return ToolError(
+                    message=(
+                        f"The write to `{params.path}` did not land on disk: "
+                        "the file content after writing differs from what was requested. "
+                        "Check the file on disk and retry."
+                    ),
+                    brief="Write verification failed",
+                )
 
             # Get file info for success message
             file_size = (await p.stat()).st_size

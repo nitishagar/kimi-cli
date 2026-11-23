@@ -11,6 +11,7 @@ from kimi_cli.soul.approval import Approval
 from kimi_cli.tools.display import DisplayBlock
 from kimi_cli.tools.file import FileActions
 from kimi_cli.tools.file.plan_mode import inspect_plan_edit_target
+from kimi_cli.tools.file.utils import verify_file_bytes
 from kimi_cli.tools.utils import load_desc
 from kimi_cli.utils.diff import build_diff_blocks
 from kimi_cli.utils.logging import logger
@@ -168,6 +169,22 @@ class StrReplaceFile(CallableTool2[Params]):
 
             # Write the modified content back to the file
             await p.write_text(content, errors="replace")
+
+            # Verify the edit landed on disk; never report success for an
+            # edit that silently failed (GH-2617).
+            if not await verify_file_bytes(p, content.encode("utf-8", errors="replace")):
+                logger.warning(
+                    "StrReplaceFile verification failed: {path}: disk content differs after edit",
+                    path=params.path,
+                )
+                return ToolError(
+                    message=(
+                        f"The edit to `{params.path}` did not land on disk: "
+                        "the file content after writing differs from what was requested. "
+                        "Check the file on disk and retry."
+                    ),
+                    brief="Write verification failed",
+                )
 
             # Count changes for success message
             total_replacements = 0

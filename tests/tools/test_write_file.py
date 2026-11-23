@@ -171,3 +171,82 @@ async def test_write_large_content(write_file_tool: WriteFile, temp_work_dir: Ka
     assert not result.is_error
     assert await file_path.exists()
     assert await file_path.read_text() == content
+
+
+async def test_write_reports_error_when_write_silently_fails(
+    write_file_tool: WriteFile, temp_work_dir: KaosPath, monkeypatch: pytest.MonkeyPatch
+):
+    """GH-2617: a new-file write that never lands on disk must not report success."""
+    file_path = temp_work_dir / "ghost.txt"
+
+    async def noop_write(self, *args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(KaosPath, "write_text", noop_write)
+    result = await write_file_tool(Params(path=str(file_path), content="hello"))
+
+    assert result.is_error
+    assert "did not land on disk" in result.message
+    assert not await file_path.exists()
+
+
+async def test_overwrite_reports_error_when_write_silently_fails(
+    write_file_tool: WriteFile, temp_work_dir: KaosPath, monkeypatch: pytest.MonkeyPatch
+):
+    """GH-2617: an overwrite that never lands on disk must not report success."""
+    file_path = temp_work_dir / "existing.txt"
+    await file_path.write_text("original")
+
+    async def noop_write(self, *args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(KaosPath, "write_text", noop_write)
+    result = await write_file_tool(Params(path=str(file_path), content="new"))
+
+    assert result.is_error
+    assert "did not land on disk" in result.message
+    assert await file_path.read_text() == "original"
+
+
+async def test_append_reports_error_when_write_silently_fails(
+    write_file_tool: WriteFile, temp_work_dir: KaosPath, monkeypatch: pytest.MonkeyPatch
+):
+    """GH-2617: an append that never lands on disk must not report success."""
+    file_path = temp_work_dir / "append.txt"
+    await file_path.write_text("original")
+
+    async def noop_append(self, *args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(KaosPath, "append_text", noop_append)
+    result = await write_file_tool(Params(path=str(file_path), content="more", mode="append"))
+
+    assert result.is_error
+    assert "did not land on disk" in result.message
+    assert await file_path.read_text() == "original"
+
+
+async def test_write_crlf_content_passes_verification(
+    write_file_tool: WriteFile, temp_work_dir: KaosPath
+):
+    """CRLF content must verify: comparison is byte-level, no newline translation."""
+    file_path = temp_work_dir / "crlf.txt"
+    content = "line1\r\nline2\r\n"
+
+    result = await write_file_tool(Params(path=str(file_path), content=content))
+
+    assert not result.is_error
+    assert await file_path.read_bytes() == content.encode("utf-8")
+
+
+async def test_append_to_file_with_invalid_utf8_passes_verification(
+    write_file_tool: WriteFile, temp_work_dir: KaosPath
+):
+    """Appending to a file with undecodable bytes preserves them and verifies."""
+    file_path = temp_work_dir / "binary_prefix.txt"
+    await file_path.write_bytes(b"\xff\xfe-invalid-\n")
+
+    result = await write_file_tool(Params(path=str(file_path), content="more\n", mode="append"))
+
+    assert not result.is_error
+    assert await file_path.read_bytes() == b"\xff\xfe-invalid-\nmore\n"

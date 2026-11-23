@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from kaos.path import KaosPath
 
 from kimi_cli.tools.file.replace import Edit, Params, StrReplaceFile
@@ -246,3 +247,40 @@ async def test_replace_empty_strings(
     assert not result.is_error
     assert "successfully edited" in result.message
     assert await file_path.read_text() == "Hello !"
+
+
+async def test_replace_reports_error_when_write_silently_fails(
+    str_replace_file_tool: StrReplaceFile,
+    temp_work_dir: KaosPath,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """GH-2617: an edit that never lands on disk must not report success."""
+    file_path = temp_work_dir / "test.txt"
+    await file_path.write_text("Hello world!")
+
+    async def noop_write(self, *args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(KaosPath, "write_text", noop_write)
+    result = await str_replace_file_tool(
+        Params(path=str(file_path), edit=Edit(old="world", new="universe"))
+    )
+
+    assert result.is_error
+    assert "did not land on disk" in result.message
+    assert await file_path.read_text() == "Hello world!"
+
+
+async def test_replace_crlf_content_passes_verification(
+    str_replace_file_tool: StrReplaceFile, temp_work_dir: KaosPath
+):
+    """CRLF file edit must verify: comparison is byte-level, no newline translation."""
+    file_path = temp_work_dir / "crlf.txt"
+    await file_path.write_bytes(b"line1\r\nline2\r\n")
+
+    result = await str_replace_file_tool(
+        Params(path=str(file_path), edit=Edit(old="line1", new="row1"))
+    )
+
+    assert not result.is_error
+    assert await file_path.read_bytes() == b"row1\nline2\n"

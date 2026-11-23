@@ -3,7 +3,10 @@ from __future__ import annotations
 import mimetypes
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from kaos.path import KaosPath
 
 MEDIA_SNIFF_BYTES = 512
 
@@ -255,3 +258,19 @@ def detect_file_type(path: str | PurePath, header: bytes | None = None) -> FileT
     if suffix in _NON_TEXT_SUFFIXES:
         return FileType(kind="unknown", mime_type="")
     return FileType(kind="text", mime_type="text/plain")
+
+
+async def verify_file_bytes(path: KaosPath, expected: bytes) -> bool:
+    """Return True iff *path* currently holds exactly *expected* bytes.
+
+    Write tools use this as a read-back check so a write that silently fails
+    to land on disk (GH-2617) is reported as an error instead of a success.
+    Comparison is byte-level: text reads apply universal-newline translation
+    while writes do not, so comparing decoded text could falsely fail on
+    CRLF content.
+    """
+    try:
+        actual = await path.read_bytes()
+    except OSError:
+        return False
+    return actual == expected
