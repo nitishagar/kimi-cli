@@ -18,13 +18,42 @@ from kimi_cli.acp.types import ACPContentBlock, MCPServer
 from kimi_cli.acp.version import ACPVersionSpec, negotiate_version
 from kimi_cli.app import KimiCLI
 from kimi_cli.auth.oauth import KIMI_CODE_OAUTH_KEY, load_tokens
-from kimi_cli.config import LLMModel, OAuthRef, load_config, save_config
+from kimi_cli.auth.platforms import is_managed_provider_key
+from kimi_cli.config import Config, LLMModel, OAuthRef, load_config, save_config
 from kimi_cli.constant import NAME, VERSION
-from kimi_cli.llm import create_llm, derive_model_capabilities
+from kimi_cli.llm import augment_provider_with_env_vars, create_llm, derive_model_capabilities
 from kimi_cli.session import Session
 from kimi_cli.soul.slash import registry as soul_slash_registry
 from kimi_cli.soul.toolset import KimiToolset
 from kimi_cli.utils.logging import logger
+
+
+def _default_provider_has_static_credentials(config: Config) -> bool:
+    """Whether the default model's provider can run without a Kimi login.
+
+    Returns ``True`` only on positive proof of static credentials: the
+    ``default_model`` resolves to a known provider that carries no ``oauth``
+    ref, uses a non-managed key, and has a non-empty effective ``api_key``
+    (config value plus ``*_API_KEY`` env overrides, which LLM creation
+    applies too). Every other state — OAuth-backed provider, empty key,
+    dangling ``default_model`` — returns ``False`` so the gate fails closed:
+    ``kimi login`` rewrites ``default_model`` to a managed model, so the
+    login bootstrap must stay reachable from an unconfigured session.
+    """
+    model = config.models.get(config.default_model)
+    if model is None:
+        return False
+    provider = config.providers.get(model.provider)
+    if provider is None:
+        return False
+    if provider.oauth is not None or is_managed_provider_key(model.provider):
+        return False
+    # Work on copies: augment() mutates in place and the caller's config
+    # may be shared with the session created after the gate.
+    provider = provider.model_copy(deep=True)
+    model = model.model_copy(deep=True)
+    augment_provider_with_env_vars(provider, model)
+    return bool(provider.api_key.get_secret_value())
 
 
 class ACPServer:
@@ -125,8 +154,17 @@ class ACPServer:
             return "token expired and no refresh token available"
         return None
 
-    def _check_auth(self) -> None:
-        """Check if Kimi Code authentication is complete. Raise AUTH_REQUIRED if not."""
+    def _check_auth(self, *, config: Config | None = None) -> None:
+        """Check if Kimi Code authentication is complete. Raise AUTH_REQUIRED if not.
+
+        Sessions whose default model resolves to a custom provider with
+        static credentials skip the Kimi-login requirement; all other
+        sessions must present a usable OAuth token.
+        """
+        if config is None:
+            config = load_config()
+        if _default_provider_has_static_credentials(config):
+            return
         reason = self._check_token_usable()
         if reason:
             auth_methods_data: list[dict[str, Any]] = []
@@ -354,6 +392,9 @@ class ACPServer:
             )
             raise acp.RequestError.invalid_params({"model_id": "Model's provider not found"})
 
+        # No auth re-gate on model switch (documented as-is): a managed model
+        # selected without a usable token fails visibly at request time, the
+        # same as on the other ungated paths (resume/prompt).
         new_llm = create_llm(
             new_provider,
             new_model,
