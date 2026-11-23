@@ -206,6 +206,144 @@ def test_get_env_int_returns_default_when_unset() -> None:
     assert get_env_int("_TEST_NONEXISTENT_VAR_12345", 77) == 77
 
 
+def test_find_next_match_agrees_with_naive_two_handler_scan() -> None:
+    """The single-pass scan must find exactly what the per-handler scans find.
+
+    Guards the union invariant of `_PLACEHOLDER_SCAN_RE`: every candidate it
+    reports must be attributable to exactly one handler at the same span.
+    """
+    from kimi_cli.ui.shell.placeholders import (
+        _IMAGE_PLACEHOLDER_RE,
+        _PASTED_TEXT_PLACEHOLDER_RE,
+        _PLACEHOLDER_SCAN_RE,
+    )
+
+    corpus = [
+        "",
+        "plain text without brackets",
+        "[Pasted text #1]",
+        "[Pasted text #1 +1 line]",
+        "[Pasted text #12 +34 lines]",
+        "[Pasted text #1 +0 lines][Pasted text #2]",
+        "[image:abc123.png,10x20]",
+        "[image:abc123.png]",
+        "[img:x.y-z_0,1x2]",
+        "[Pasted text #1][image:a.png,2x3][Pasted text #2 +4 lines]",
+        "[image:a.png][image:b.png,1x1]",
+        "[not a token]",
+        "[Pasted text #]",
+        "[Pasted text #1 + lines]",
+        "[Pasted text #1 +2 linez]",
+        "[[Pasted text #1]]",
+        "[[image:a.png]]",
+        "[Pasted text #1",
+        "Pasted text #1]",
+        "[image:]",
+        "[image:a.png,]",
+        "[image:a.png,10x]",
+        "[IMAGE:A.PNG]",
+        "[pasted text #1]",
+        "[Pasted text  #1]",
+        "x" * 5000 + "[Pasted text #7 +8 lines]" + "y" * 5000,
+        "[a:b]" * 100,
+        "[Pasted text #1 +1 line]" * 100,
+        "mix [Pasted text #3] middle [image:z.png,9x9] end",
+    ]
+    for text in corpus:
+        naive_spans: list[tuple[int, int, str]] = []
+        pos = 0
+        while True:
+            earliest: tuple[int, int, str] | None = None
+            for pattern, kind in (
+                (_PASTED_TEXT_PLACEHOLDER_RE, "text"),
+                (_IMAGE_PLACEHOLDER_RE, "image"),
+            ):
+                found = pattern.search(text, pos)
+                if found is not None and (earliest is None or found.start() < earliest[0]):
+                    earliest = (found.start(), found.end(), kind)
+            if earliest is None:
+                break
+            naive_spans.append(earliest)
+            pos = earliest[1]
+
+        scan_spans: list[tuple[int, int, str]] = []
+        pos = 0
+        while (scan := _PLACEHOLDER_SCAN_RE.search(text, pos)) is not None:
+            attributed: tuple[int, int, str] | None = None
+            for pattern, kind in (
+                (_PASTED_TEXT_PLACEHOLDER_RE, "text"),
+                (_IMAGE_PLACEHOLDER_RE, "image"),
+            ):
+                anchored = pattern.match(text, scan.start())
+                if anchored is not None:
+                    attributed = (anchored.start(), anchored.end(), kind)
+                    break
+            assert attributed is not None, f"unattributable scan hit in {text!r}"
+            assert (attributed[0], attributed[1]) == (
+                scan.start(),
+                scan.end(),
+            ), f"span drift in {text!r}"
+            scan_spans.append(attributed)
+            pos = attributed[1]
+
+        assert scan_spans == naive_spans, f"mismatch in {text!r}"
+
+
+def test_resolve_command_scales_linearly_with_many_tokens() -> None:
+    """Regression test for issue #2655: resolving thousands of placeholder-like
+    tokens in a large prompt must not hang (was O(tokens x len), ~260s)."""
+    import time
+
+    manager = PromptPlaceholderManager()
+    token_count = 20000
+    command = "[Pasted text #1 +5 lines]" * token_count
+
+    started = time.perf_counter()
+    resolved = manager.resolve_command(command)
+    elapsed = time.perf_counter() - started
+
+    assert len(resolved.resolved_text) == len(command)
+    assert elapsed < 10, f"resolve_command took {elapsed:.1f}s for {token_count} tokens"
+
+
+def test_serialize_for_history_scales_with_tokens_and_unmatched_brackets() -> None:
+    """Thousands of tokens plus unmatched-bracket noise must stay linear.
+
+    The old per-handler scan re-scanned the whole tail for every token when
+    one token kind was absent, hanging for tens of seconds here.
+    """
+    import time
+
+    manager = PromptPlaceholderManager()
+    command = "[Pasted text #1 +5 lines][oops " * 20000
+
+    started = time.perf_counter()
+    history = manager.serialize_for_history(command)
+    elapsed = time.perf_counter() - started
+
+    assert history == command  # unknown tokens stay literal
+    assert elapsed < 10, f"serialize_for_history took {elapsed:.1f}s"
+
+
+def test_refold_after_editor_skips_diff_for_unchanged_large_paste() -> None:
+    """Regression test for issue #2655: refolding an unedited ~900KB paste
+    must not run the superlinear SequenceMatcher diff (hung 15+ minutes)."""
+    import time
+
+    manager = PromptPlaceholderManager()
+    pasted_text = "lorem ipsum dolor sit amet\n" * 36000  # ~900KB
+    token = manager.maybe_placeholderize_pasted_text(pasted_text)
+    original_command = f"Summarize this: {token}"
+    expanded = manager.expand_for_editor(original_command)
+
+    started = time.perf_counter()
+    refolded = manager.refold_after_editor(expanded, original_command)
+    elapsed = time.perf_counter() - started
+
+    assert refolded == original_command
+    assert elapsed < 10, f"refold_after_editor took {elapsed:.1f}s for unchanged paste"
+
+
 def test_attachment_cache_loads_legacy_root(tmp_path) -> None:
     legacy_root = tmp_path / "legacy"
     legacy_image_dir = legacy_root / "images"

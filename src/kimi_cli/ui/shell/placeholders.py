@@ -30,6 +30,16 @@ _IMAGE_PLACEHOLDER_RE = re.compile(
 _PASTED_TEXT_PLACEHOLDER_RE = re.compile(
     r"\[Pasted text #(?P<id>\d+)(?: \+(?P<lines>\d+) lines?)?\]"
 )
+# Single-pass scan pattern: the exact union of the two handler patterns above,
+# minus the named groups. `_find_next_match` uses one `search` with this
+# pattern to locate the next candidate token, then attributes it to a handler
+# with an anchored `match`. Running one full `search` per handler per token is
+# O(tokens x len(text)) and hangs for minutes on large prompts (issue #2655).
+# Keep this in sync with both patterns above; the equivalence test guards it.
+_PLACEHOLDER_SCAN_RE = re.compile(
+    r"\[(?:Pasted text #\d+(?: \+\d+ lines?)?"
+    r"|[a-zA-Z0-9_\-]+:[a-zA-Z0-9_\-\.]+(?:,\d+x\d+)?)\]"
+)
 
 _TEXT_PASTE_CHAR_THRESHOLD = get_env_int("KIMI_CLI_PASTE_CHAR_THRESHOLD", 1000)
 _TEXT_PASTE_LINE_THRESHOLD = get_env_int("KIMI_CLI_PASTE_LINE_THRESHOLD", 15)
@@ -314,6 +324,11 @@ class PastedTextPlaceholderHandler:
         expanded_original, intervals = self._expanded_text_and_intervals(original_command)
         if not intervals:
             return edited_text
+        if edited_text == expanded_original:
+            # Nothing changed in the editor: every interval would map back
+            # identically, so skip the SequenceMatcher diff, which is
+            # superlinear on large pasted text (issue #2655).
+            return original_command
 
         opcodes = SequenceMatcher(
             a=expanded_original,
@@ -501,14 +516,26 @@ class PromptPlaceholderManager:
         return self._text_handler.refold_after_editor(edited_text, original_command)
 
     def _find_next_match(self, text: str, start: int = 0) -> PlaceholderTokenMatch | None:
-        earliest: PlaceholderTokenMatch | None = None
-        for handler in self._handlers:
-            match = handler.find_next(text, start)
-            if match is None:
-                continue
-            if earliest is None or match.start < earliest.start:
-                earliest = match
-        return earliest
+        pos = start
+        while (scan := _PLACEHOLDER_SCAN_RE.search(text, pos)) is not None:
+            for handler, pattern in (
+                (self._text_handler, _PASTED_TEXT_PLACEHOLDER_RE),
+                (self._image_handler, _IMAGE_PLACEHOLDER_RE),
+            ):
+                match = pattern.match(text, scan.start())
+                if match is None:
+                    continue
+                return PlaceholderTokenMatch(
+                    start=match.start(),
+                    end=match.end(),
+                    raw=match.group(0),
+                    handler=handler,
+                    match=match,
+                )
+            # Unreachable while the scan pattern stays the union of both
+            # handler patterns; skip the candidate to guarantee progress.
+            pos = scan.start() + 1
+        return None
 
     def _rewrite_command(
         self,
